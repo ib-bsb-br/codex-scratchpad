@@ -1,4 +1,3 @@
 shot-scraper
-datasette
-sqlite-utils
 llm
+<!-- placeholder for codex to edit -->
