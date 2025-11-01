@@ -496,8 +496,20 @@ $Steps = @(
     }
 )
 
-New-Item -Path $RegistryBase -Force | Out-Null
-New-Item -Path $StepsKey -Force | Out-Null
+try {
+    if (-not (Test-Path $RegistryBase)) {
+        New-Item -Path $RegistryBase -Force -ErrorAction Stop | Out-Null
+    }
+    if (-not (Test-Path $StepsKey)) {
+        New-Item -Path $StepsKey -Force -ErrorAction Stop | Out-Null
+    }
+    Write-Log "Registry keys initialized successfully." 'INFO'
+} catch {
+    Write-Log "Failed to create registry keys in HKLM:\Software\PwshSetup: $($_.Exception.Message)" 'ERROR'
+    Write-Log "This may be due to insufficient permissions or WOW64 registry redirection." 'ERROR'
+    Write-Log "Please run as Administrator with elevated privileges, or check registry permissions." 'ERROR'
+    throw "Registry access denied. Exit:1"
+}
 
 try {
     Invoke-Preflight
