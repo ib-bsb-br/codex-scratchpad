@@ -6,7 +6,7 @@ on:
       repo_name:
         description: 'Name for the new repository (must be unique)'
         required: true
-        default: 'unzipped-content'
+        default: 'rukovoditel'
       zip_url:
         description: 'URL of the ZIP file to download'
         required: true
