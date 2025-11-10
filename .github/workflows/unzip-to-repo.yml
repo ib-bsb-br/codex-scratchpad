@@ -227,7 +227,7 @@ jobs:
                 repo: repoName
               });
               
-              console.log(`⚠️ Repository ${user.login}/${repoName} was created but workflow failed.`);
+              console.log(`⚠️ Repository ${user.login}/${repoName} created but workflow failed.`);
               console.log(`Consider deleting it manually if it's empty: https://github.com/${user.login}/${repoName}/settings`);
               
             } catch (error) {
