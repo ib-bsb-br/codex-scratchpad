@@ -17,7 +17,7 @@ jobs:
         run: sudo bash ./build-debian13-usb.sh  # Run the adapted build script (in repo)
       
       - name: Upload image artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: Debian13-USB-Image
           path: debian13_usb_build/debian13-usb.img
