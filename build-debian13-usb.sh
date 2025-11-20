@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-debian13-usb.sh - Build Debian 13 (Trixie) amd64 USB image (BIOS, persistent)
+# build-debian13-usb.sh - Build Debian 13 (Trixie) amd64 USB image (BIOS+UEFI, persistent)
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ echo ">>> Attaching loop device..."
 LOOPDEV=$(sudo losetup --find --show "$WORKDIR/$IMG_NAME")   # e.g., /dev/loop0
 echo "Loop device: $LOOPDEV"
 
-echo ">>> Partitioning the image with GPT (BIOS)..."
+echo ">>> Partitioning the image with GPT (BIOS+UEFI)..."
 # Create GPT partition table and required partitions:
 #  - Partition 1: BIOS grub partition (Type bios_grub, ~2 MiB)
 #  - Partition 2: EFI system partition (Type ESP, 100 MiB FAT32)
@@ -68,7 +68,7 @@ sudo chroot "$MNT" /bin/bash -c "echo 'deb http://deb.debian.org/debian trixie-u
 echo ">>> Installing core packages in chroot (kernel, X11, etc.)..."
 sudo chroot "$MNT" apt-get update
 sudo chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    linux-image-amd64 grub-pc sudo \
+    linux-image-amd64 grub-pc-bin grub-efi-ia32-bin grub-efi-amd64-bin sudo \
     xserver-xorg xinit xterm ratpoison \
     treesheets iwd \
     firmware-iwlwifi firmware-realtek firmware-atheros
@@ -130,9 +130,13 @@ sudo chroot "$MNT" chown user:user /home/user/.bash_profile /home/user/.xinitrc
 # Enable iwd daemon to start on boot (for Wi-Fi functionality)
 sudo chroot "$MNT" systemctl enable iwd
 
-echo ">>> Installing GRUB bootloader (BIOS)..."
+echo ">>> Installing GRUB bootloader (BIOS and UEFI)..."
 # Install GRUB for BIOS (MBR)
-sudo chroot "$MNT" grub-install --target=i386-pc --boot-directory=/boot --recheck "${LOOPDEV}"
+sudo chroot "$MNT" grub-install --no-floppy --target=i386-pc --boot-directory=/boot --recheck "${LOOPDEV}"
+# Install GRUB for 64-bit UEFI
+sudo chroot "$MNT" grub-install --removable --target=x86_64-efi --boot-directory=/boot --efi-directory=/boot/efi "${LOOPDEV}"
+# Install GRUB for 32-bit UEFI
+sudo chroot "$MNT" grub-install --removable --target=i386-efi --boot-directory=/boot --efi-directory=/boot/efi "${LOOPDEV}"
 sudo chroot "$MNT" update-grub
 
 echo ">>> Cleanup and unmounting..."
