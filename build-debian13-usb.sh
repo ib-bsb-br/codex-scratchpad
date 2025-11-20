@@ -70,16 +70,14 @@ sudo chroot "$MNT" apt-get update
 sudo chroot "$MNT" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     linux-image-amd64 grub-pc-bin grub-efi-ia32-bin grub-efi-amd64-bin sudo \
     xserver-xorg xinit xterm ratpoison \
-    treesheets iwd \
+    gdebi chromium-shell alacritty iwd \
     firmware-iwlwifi firmware-realtek firmware-atheros
 
 # Install Impala (WiFi TUI) inside the chroot:
 echo ">>> Installing Impala (Wi-Fi TUI)..."
-IMPALA_URL="https://github.com/pythops/impala/releases/download/v0.4.1/impala_v0.4.1_x86_64-unknown-linux-gnu.tar.gz"
-wget -O "$WORKDIR/impala.tar.gz" "$IMPALA_URL"
+IMPALA_URL="https://github.com/pythops/impala/releases/download/v0.4.1/impala-aarch64-unknown-linux-gnu"
+wget -O "$WORKDIR/impala" "$IMPALA_URL"
 sudo chroot "$MNT" mkdir -p /usr/local/bin
-sudo tar -xzf "$WORKDIR/impala.tar.gz" -C "$WORKDIR"
-# Assume the tar contains a binary named 'impala'
 if [ -f "$WORKDIR/impala" ]; then
   sudo mv "$WORKDIR/impala" "$MNT/usr/local/bin/impala"
   sudo chroot "$MNT" chmod +x /usr/local/bin/impala
@@ -116,10 +114,6 @@ cat << 'EOF' | sudo tee "$MNT/home/user/.xinitrc" > /dev/null
 #!/bin/sh
 # .xinitrc - X session startup for user
 xsetroot -solid black &
-# Launch Impala Wi-Fi TUI in an xterm (terminal window)
-xterm -bg black -fg white -e impala &
-# Launch TreeSheets
-treesheets &
 # Start the Ratpoison window manager
 exec ratpoison
 EOF
