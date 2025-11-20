@@ -1,0 +1,23 @@
+name: Build Debian 13 USB Image
+on: [workflow_dispatch]  # Manual trigger; adjust as needed (e.g., push)
+
+jobs:
+  build_usb_image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap parted dosfstools e2fsprogs wget tar
+
+      - name: Build bootable Debian 13 image
+        run: sudo bash ./build-debian13-usb.sh  # Run the adapted build script (in repo)
+      
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: Debian13-USB-Image
+          path: debian13_usb_build/debian13-usb.img
