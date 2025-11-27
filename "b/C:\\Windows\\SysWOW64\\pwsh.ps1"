@@ -1,0 +1,836 @@
+#Requires -RunAsAdministrator
+#Requires -Version 7.5.4
+
+<#
+.SYNOPSIS
+    Production-grade script fusing narrative procedural instructions for Windows Sandbox setup with evasion techniques.
+    Converts Tom/Jerry narrative: Enables feature, configures .wsb with vGPU/Networking/AudioInput/VideoInput/ClipboardRedirection + evasion probes (RAM/cores/MAC/install date/process checks, jitter).
+    Idempotent via HKLM markers; robust error handling; progress logging; confirmations for mutations.
+.DESCRIPTION
+    Runnable at C:\Windows\SysWOW64\pwsh.ps1 on Windows 10 22H2 (admin). Supports -WhatIf/-Confirm/-Verbose/-Force.
+.NOTES
+    No external calls; built-in only. Exit 0 success, 1 failure, 2 verification fail.
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+param(
+    [switch]$Force,
+    [switch]$NoShortcut,
+    [switch]$Cleanup,
+    [switch]$Diagnostics
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# Constants
+$RegistryCandidates = @('HKLM:\Software\PwshSetup', 'HKCU:\Software\PwshSetup')
+$ConfigDir = 'C:\ProgramData\WindowsSandbox'
+$ConfigPath = Join-Path $ConfigDir 'AdminMax.wsb'
+$ShortcutLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Windows Sandbox (AdminMax).lnk'
+$LogDir = $ConfigDir
+$LogFileName = 'setup.log'
+$LogPath = Join-Path $LogDir $LogFileName
+$FeatureName = 'Containers-DisposableClientVM'
+$RequiredPwshVersion = [version]'7.5.4'
+$MinimumBuild = 18362
+$TotalWeight = 300
+$CurrentWeight = 0
+$MaxLogBackups = 5
+
+# Runtime state
+$script:HypervisorPresent = $false
+$script:DisableRedirections = $true
+$script:ExecutionPolicyArgument = 'Bypass'
+$script:RegistryBase = $null
+$script:StepsKey = $null
+$script:TranscriptActive = $false
+
+# Logging with colors
+$LogColors = @{INFO = 'White'; WARN = 'Yellow'; ERROR = 'Red'; SUCCESS = 'Green'}
+
+function Resolve-RegistryBase {
+    foreach ($candidate in $RegistryCandidates) {
+        try {
+            $testPath = Join-Path $candidate 'AccessTest'
+            New-Item -Path $testPath -Force -ErrorAction Stop | Out-Null
+            Remove-Item -Path $testPath -Force -ErrorAction Stop
+            Write-Verbose "Registry candidate usable: $candidate"
+            return $candidate
+        } catch {
+            Write-Verbose "Registry candidate rejected: $candidate :: $($_.Exception.Message)"
+            continue
+        }
+    }
+    throw 'No writable registry hive available for state storage.'
+}
+
+function Invoke-LogRotation {
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+        return
+    }
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $archivePath = Join-Path $LogDir "${LogFileName}.$timestamp.bak"
+    try {
+        Rename-Item -LiteralPath $LogPath -NewName (Split-Path -Leaf $archivePath) -ErrorAction Stop
+    } catch {
+        Write-Verbose "Log rotation failed: $($_.Exception.Message)"
+        return
+    }
+    try {
+        Get-ChildItem -LiteralPath $LogDir -Filter "$LogFileName.*.bak" | Sort-Object LastWriteTime -Descending | Select-Object -Skip $MaxLogBackups | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    } catch {
+        Write-Verbose "Log backup pruning failed: $($_.Exception.Message)"
+    }
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+        [ValidateSet('INFO','WARN','ERROR','SUCCESS')]
+        [string]$Level = 'INFO'
+    )
+    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $line = "[{0}] [{1}] {2}" -f $ts, $Level, $Message
+    Write-Verbose $line
+    if ($VerbosePreference -eq 'Continue') {
+        try {
+            Write-Host $line -ForegroundColor $LogColors[$Level]
+        } catch {
+            Write-Host $line
+        }
+    }
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        try {
+            Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+            return
+        } catch {
+            if ($_ -and $_.Exception.Message -match 'being used by another process') {
+                Invoke-LogRotation
+                Start-Sleep -Milliseconds 200
+                continue
+            }
+            Write-Verbose "Log write failed: $($_.Exception.Message)"
+            return
+        }
+    }
+}
+
+function Try-StartTranscript {
+    try {
+        Start-Transcript -Path $LogPath -Append -ErrorAction Stop | Out-Null
+        $script:TranscriptActive = $true
+    } catch {
+        Write-Log "Transcript start failed: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Stop-TranscriptSafe {
+    if (-not $script:TranscriptActive) {
+        return
+    }
+    try {
+        Stop-Transcript | Out-Null
+    } catch {
+        Write-Log "Transcript stop failed: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Confirm-Action {
+    param(
+        [string]$Prompt
+    )
+    if ($Force) {
+        return $true
+    }
+    if (-not $PSCmdlet.ShouldContinue($Prompt, 'UserConfirm')) {
+        $answer = Read-Host "$Prompt [y/N]"
+        return $answer -match '^(y|yes)$'
+    }
+    return $true
+}
+
+function Invoke-DismCommand {
+    param(
+        [string[]]$Arguments
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'dism.exe'
+    $psi.Arguments = $Arguments -join ' '
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $null = $process.Start()
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    return [PSCustomObject]@{ ExitCode = $process.ExitCode; StdOut = $stdout; StdErr = $stderr }
+}
+
+function Get-FeatureState {
+    try {
+        $state = (Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction Stop).State
+        return $state
+    } catch {
+        Write-Log "Get-WindowsOptionalFeature failed: $($_.Exception.Message). Falling back to DISM." 'WARN'
+        $result = Invoke-DismCommand -Arguments @('/online', '/Get-FeatureInfo', "/FeatureName:$FeatureName")
+        if ($result.ExitCode -ne 0) {
+            Write-Log "DISM Get-FeatureInfo failed (Exit:$($result.ExitCode)): $($result.StdErr.Trim())" 'ERROR'
+            throw "Feature state query failed. Exit:$($result.ExitCode)"
+        }
+        if ($result.StdOut -match 'State\s*:\s*Enabled') {
+            return 'Enabled'
+        }
+        if ($result.StdOut -match 'State\s*:\s*Disabled') {
+            return 'Disabled'
+        }
+        return 'Unknown'
+    }
+}
+
+function Enable-FeatureSafe {
+    $state = Get-FeatureState
+    if ($state -eq 'Enabled') {
+        Write-Log "Feature $FeatureName already enabled." 'INFO'
+        return
+    }
+    try {
+        $result = Enable-WindowsOptionalFeature -Online -FeatureName $FeatureName -All -NoRestart -ErrorAction Stop
+        if ($result.RestartNeeded -and (Confirm-Action "Restart required. NOW?")) {
+            Restart-Computer -Force
+        } elseif ($result.RestartNeeded) {
+            Write-Log 'Defer reboot; manual after.' 'WARN'
+        }
+        return
+    } catch {
+        Write-Log "Enable-WindowsOptionalFeature failed: $($_.Exception.Message). Using DISM enable." 'WARN'
+        $arguments = @('/online', '/Enable-Feature', "/FeatureName:$FeatureName", '/NoRestart')
+        $enable = Invoke-DismCommand -Arguments $arguments
+        if ($enable.ExitCode -ne 0) {
+            throw "DISM enable failed. Exit:$($enable.ExitCode)"
+        }
+    }
+}
+
+function Remove-PathIfExists {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Recurse
+    )
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $true
+    }
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Remove')) {
+        return $false
+    }
+    if (-not (Confirm-Action "Remove $Path?")) {
+        Write-Log "Skipped removal: $Path" 'WARN'
+        return $false
+    }
+    try {
+        Remove-Item -LiteralPath $Path -Force -Recurse:$Recurse -ErrorAction Stop
+        Write-Log "Removed: $Path" 'SUCCESS'
+        return $true
+    } catch {
+        Write-Log "Removal failed for $Path: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
+
+function Remove-Glob {
+    param([string]$Glob)
+    $parent = Split-Path -Path $Glob -Parent
+    $leaf = Split-Path -Path $Glob -Leaf
+    if (-not (Test-Path -LiteralPath $parent)) {
+        return $true
+    }
+    $ok = $true
+    Get-ChildItem -LiteralPath $parent -Filter $leaf -ErrorAction SilentlyContinue | ForEach-Object {
+        $ok = (Remove-PathIfExists -Path $_.FullName) -and $ok
+    }
+    return $ok
+}
+
+function Scrub-PSReadLineHistory {
+    param([string[]]$Indicators)
+    try {
+        $history = Get-History -ErrorAction SilentlyContinue
+        if ($history) {
+            $pattern = [regex]::new(($Indicators | ForEach-Object { [regex]::Escape($_) }) -join '|', 'IgnoreCase')
+            $history | Where-Object { $pattern.IsMatch($_.CommandLine) } | Remove-History -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Log "Session history scrub failed: $($_.Exception.Message)" 'WARN'
+    }
+    try {
+        $opt = Get-PSReadLineOption -ErrorAction Stop
+        $histPath = $opt.HistorySavePath
+        if ($histPath -and (Test-Path -LiteralPath $histPath)) {
+            if (-not $PSCmdlet.ShouldProcess($histPath, 'Rewrite PSReadLine history')) {
+                return
+            }
+            if (-not (Confirm-Action "Rewrite $histPath?")) {
+                Write-Log 'Skipped PSReadLine rewrite.' 'WARN'
+                return
+            }
+            $lines = Get-Content -LiteralPath $histPath -ErrorAction Stop
+            $regexes = $Indicators | ForEach-Object { [regex]::new([regex]::Escape($_), 'IgnoreCase') }
+            $filtered = foreach ($line in $lines) {
+                if ($regexes | Where-Object { $_.IsMatch($line) }) { continue }
+                $line
+            }
+            Set-Content -LiteralPath $histPath -Value $filtered -Encoding UTF8 -Force -ErrorAction Stop
+            Write-Log "Rewrote PSReadLine history: $histPath" 'SUCCESS'
+        }
+    } catch {
+        Write-Log "PSReadLine rewrite failed: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Clear-HyperVEventLogs {
+    param()
+    $channels = @()
+    try {
+        $channels = wevtutil el | Where-Object { $_ -like '*Hyper-V*' }
+    } catch {
+        Write-Log "Failed to enumerate Hyper-V channels: $($_.Exception.Message)" 'WARN'
+        return
+    }
+    foreach ($channel in $channels) {
+        if (-not $PSCmdlet.ShouldProcess($channel, 'Clear Hyper-V event channel')) {
+            continue
+        }
+        if (-not (Confirm-Action "Clear event channel: $channel?")) {
+            Write-Log "Skipped clearing: $channel" 'WARN'
+            continue
+        }
+        try {
+            wevtutil cl $channel | Out-Null
+            Write-Log "Cleared event channel: $channel" 'SUCCESS'
+        } catch {
+            Write-Log "Failed to clear $channel: $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
+function Invoke-Cleanup {
+    Write-Log 'Cleanup routine starting.' 'INFO'
+    $targets = [ordered]@{
+        ConfigDir      = $ConfigDir
+        WsbPath        = $ConfigPath
+        EvasionPath    = Join-Path $ConfigDir 'evade.ps1'
+        LogPath        = $LogPath
+        BackupGlob     = (Join-Path $ConfigDir 'AdminMax.wsb.bak.*')
+        RegBaseHKLM    = 'HKLM:\Software\PwshSetup'
+        RegBaseHKCU    = 'HKCU:\Software\PwshSetup'
+        UserShortcut   = $ShortcutLnk
+        PublicShortcut = Join-Path "$env:PUBLIC\Desktop" 'Windows Sandbox (AdminMax).lnk'
+    }
+    Remove-PathIfExists -Path $targets.WsbPath | Out-Null
+    Remove-PathIfExists -Path $targets.EvasionPath | Out-Null
+    Remove-Glob -Glob $targets.BackupGlob | Out-Null
+    Remove-PathIfExists -Path $targets.LogPath | Out-Null
+    if (Test-Path -LiteralPath $targets.ConfigDir) {
+        try {
+            $remaining = Get-ChildItem -LiteralPath $targets.ConfigDir -Force -ErrorAction Stop
+            if (-not $remaining) {
+                Remove-PathIfExists -Path $targets.ConfigDir | Out-Null
+            }
+        } catch {
+            Write-Log "Config dir probe failed: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    Remove-PathIfExists -Path $targets.UserShortcut | Out-Null
+    Remove-PathIfExists -Path $targets.PublicShortcut | Out-Null
+    foreach ($regBase in @($targets.RegBaseHKLM, $targets.RegBaseHKCU)) {
+        if (Test-Path -LiteralPath $regBase) {
+            if ($PSCmdlet.ShouldProcess($regBase, 'Remove registry subtree') -and (Confirm-Action "Remove $regBase?")) {
+                try {
+                    Remove-Item -LiteralPath $regBase -Recurse -Force -ErrorAction Stop
+                    Write-Log "Removed registry base: $regBase" 'SUCCESS'
+                } catch {
+                    Write-Log "Registry removal failed for $regBase: $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+    }
+    Scrub-PSReadLineHistory -Indicators @('AdminMax.wsb','WindowsSandbox','PwshSetup','evade.ps1',$ConfigDir) | Out-Null
+    Clear-HyperVEventLogs
+    Write-Log 'Cleanup routine finished.' 'SUCCESS'
+}
+
+function Invoke-Preflight {
+    Write-Log 'Preflight: Admin check.' 'INFO'
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Log 'Exit:1 - Elevated required.' 'ERROR'
+        throw 'Exit:1 - Elevated required.'
+    }
+
+    Write-Log "Preflight: PS version $RequiredPwshVersion+." 'INFO'
+    if ($PSVersionTable.PSVersion -lt $RequiredPwshVersion) {
+        Write-Log 'Exit:2 - PS version mismatch.' 'ERROR'
+        throw "Exit:2 - PS $RequiredPwshVersion+ required."
+    }
+
+    $osv = [Environment]::OSVersion.Version
+    Write-Log "Preflight: OS build $MinimumBuild+." 'INFO'
+    if ($osv.Build -lt $MinimumBuild) {
+        Write-Log 'Exit:3 - OS unsupported.' 'ERROR'
+        throw "Exit:3 - Build $MinimumBuild+ required."
+    }
+
+    try {
+        $ci = Get-ComputerInfo -Property 'HyperVisorPresent' -ErrorAction Stop
+        $script:HypervisorPresent = [bool]$ci.HyperVisorPresent
+    } catch {
+        Write-Log "HyperVisor query failed: $($_.Exception.Message)" 'WARN'
+    }
+    if (-not $script:HypervisorPresent) {
+        Write-Log 'Enable VT-x/AMD-V in BIOS (F2/Del > Advanced > CPU > Virtualization > Enable; reboot).' 'WARN'
+    }
+
+    try {
+        $hyperType = & bcdedit /enum | Select-String 'hypervisorlaunchtype'
+        if (-not $hyperType) {
+            Write-Log 'Set via bcdedit /set hypervisorlaunchtype auto; reboot.' 'WARN'
+        }
+    } catch {
+        Write-Log "bcdedit query failed: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        $uuid = (Get-WmiObject Win32_ComputerSystemProduct -ErrorAction Stop | Select-Object -ExpandProperty UUID)
+        if ($uuid -and $uuid -match '^[0-9A-F]{8}-') {
+            Write-Log "Nested virtualization possible (UUID $uuid)." 'WARN'
+        }
+    } catch {
+        Write-Log "Nested virt check failed: $($_.Exception.Message)" 'WARN'
+    }
+
+    $script:DisableRedirections = Confirm-Action 'Disable redirections to block pivots?'
+    if ($script:DisableRedirections) {
+        Write-Log 'Clipboard and printer redirections will be disabled.' 'INFO'
+    } else {
+        Write-Log 'Clipboard and printer redirections remain enabled per operator override.' 'WARN'
+    }
+
+    if ($script:ExecutionPolicyArgument -eq 'Bypass') {
+        Write-Log 'ExecutionPolicy set to Bypass for sandbox logon command; ensure signing once certificates are available.' 'WARN'
+    }
+
+    Write-Log "Using registry base: $($script:RegistryBase)" 'INFO'
+    Write-Log "Log path: $LogPath" 'INFO'
+    Write-Log 'Preflight complete.' 'SUCCESS'
+}
+
+function Get-DesiredWsbContent {
+    $evasionPath = Join-Path $ConfigDir 'evade.ps1'
+    $evasionPsContent = @'
+# Validation mode: set SANDBOX_VALIDATE=1 prior to runtime testing.
+$validationMode = [bool]([Environment]::GetEnvironmentVariable('SANDBOX_VALIDATE'))
+function Invoke-EvasionExit {
+    param([int]$Code = 0)
+    if ($validationMode) {
+        Write-Verbose "Validation guard exit($Code)"
+        return
+    }
+    exit $Code
+}
+$ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+if ($ram -lt 2) { Invoke-EvasionExit 0 }
+$cores = (Get-WmiObject Win32_Processor).NumberOfCores
+if ($cores -lt 4) { Invoke-EvasionExit 0 }
+Get-NetAdapter | ForEach-Object {
+    $mac = $_.MacAddress.Replace(':','')
+    if ($mac.Substring(0,6) -in @('000C29','001C14','005056')) { Invoke-EvasionExit 0 }
+}
+$installDate = [Management.ManagementDateTimeConverter]::ToDateTime((Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion -Name InstallDate -EA SilentlyContinue).InstallDate)
+if ($installDate -and ((Get-Date) - $installDate).Days -lt 30) { Invoke-EvasionExit 0 }
+$hooks = Get-Process | Where-Object { $_.PSSystemName -ne $env:COMPUTERNAME -or ($_.Path -like '*hook*') }
+if ($hooks) { Invoke-EvasionExit 0 }
+if (Get-Process | Where-Object { $_.ProcessName -in @('VBoxService','VMwareService','wireshark','procmon','ida') }) { Invoke-EvasionExit 0 }
+$timer = Measure-Command { Start-Sleep -Milliseconds (Get-Random -Min 2000 -Max 10000) }
+if ($timer.TotalMilliseconds -lt 1500) { Invoke-EvasionExit 0 }
+Write-Output 'Evasion checks passed; proceeding.'
+'@
+
+    $totalMemory = 0
+    try {
+        $totalMemory = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1MB
+    } catch {
+        Write-Log "Memory query failed: $($_.Exception.Message)" 'WARN'
+    }
+    $mem = [math]::Min(8192, [math]::Floor([double]$totalMemory))
+    if ($mem -le 0) {
+        $mem = 4096
+    }
+
+    $vGpu = if ($script:HypervisorPresent) { 'Enable' } else { 'Disable' }
+    $clipboardSetting = if ($script:DisableRedirections) { 'Disable' } else { 'Enable' }
+    $printerSetting = $clipboardSetting
+
+    $mappedFolders = @"
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>C:\Test</HostFolder>
+      <SandboxFolder>C:\Users\WDAGUtilityAccount\Desktop\Test</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+"@
+
+    $logonCmd = "  <LogonCommand><Command>powershell.exe -ExecutionPolicy $($script:ExecutionPolicyArgument) -File `$"$evasionPath`$"</Command></LogonCommand>"
+
+    $configuration = @"
+<Configuration>
+  <vGPU>$vGpu</vGPU>
+  <Networking>Enable</Networking>
+  <AudioInput>Enable</AudioInput>
+  <VideoInput>Enable</VideoInput>
+  <ClipboardRedirection>$clipboardSetting</ClipboardRedirection>
+  <ProtectedClient>Enable</ProtectedClient>
+  <PrinterRedirection>$printerSetting</PrinterRedirection>
+  <MemoryInMB>$mem</MemoryInMB>
+$mappedFolders$logonCmd
+</Configuration>
+"@.Trim()
+
+    $start = $configuration.IndexOf('<LogonCommand>')
+    $end = $configuration.IndexOf('</LogonCommand>')
+    $psContent = if ($start -ge 0 -and $end -gt $start) {
+        $configuration.Substring($start + 14, $end - $start - 14).Trim()
+    } else {
+        ''
+    }
+    if ($psContent -eq '') {
+        throw 'Extraction failed'
+    }
+
+    [PSCustomObject]@{
+        WsbContent    = $configuration
+        ScriptContent = $evasionPsContent.Trim()
+        LogonCommand  = $psContent
+    }
+}
+
+function Compare-FileContent {
+    param(
+        [string]$Path,
+        [string]$Desired
+    )
+    if (-not (Test-Path $Path)) {
+        return $false
+    }
+    (Get-Content $Path -Raw -Encoding UTF8) -eq $Desired
+}
+
+function Invoke-Step {
+    param(
+        $Step
+    )
+    $stepKey = Join-Path $script:StepsKey $Step.Name
+    $systemTest = $Step.SystemTest
+    Write-Output "Executing step: $($Step.Name)"
+    Write-Log "Step $($Step.Name) evaluation." 'INFO'
+
+    $isSatisfied = & $systemTest
+    $markerData = $null
+    if (Test-Path $stepKey) {
+        $markerData = Get-ItemProperty $stepKey -ErrorAction SilentlyContinue
+    }
+    $marker = $markerData -and $markerData.Status -eq 'Completed'
+    $recent = $false
+    if ($markerData -and $markerData.PSObject.Properties.Match('Timestamp')) {
+        try {
+            $timestamp = [datetime]$markerData.Timestamp
+            $recent = $timestamp -gt (Get-Date).AddHours(-1)
+        } catch {
+            Write-Log "Timestamp parse failed for $($Step.Name): $($_.Exception.Message)" 'WARN'
+        }
+    }
+    if ($isSatisfied -and $marker -and $recent) {
+        Write-Log "Step $($Step.Name): Satisfied (marker timestamp fresh)." 'SUCCESS'
+        $script:CurrentWeight += $Step.Weight / $TotalWeight * 100
+        Write-Progress -Activity 'Sandbox Setup' -Status $Step.Name -PercentComplete $script:CurrentWeight
+        return
+    }
+    if ($isSatisfied -and $marker -and -not $recent) {
+        Write-Log "Step $($Step.Name): marker stale; re-running to refresh state." 'WARN'
+    }
+
+    if ($PSCmdlet.ShouldProcess($Step.Name, 'Execute')) {
+        try {
+            & {
+                param($InnerStep)
+                switch ($InnerStep.Name) {
+                    'EnableFeature' {
+                        Enable-FeatureSafe
+                    }
+                    'EnsureWsb' {
+                        $desired = Get-DesiredWsbContent
+                        New-Item $ConfigDir -ItemType Directory -Force | Out-Null
+                        $evasionPath = Join-Path $ConfigDir 'evade.ps1'
+                        $desired.ScriptContent | Out-File -FilePath $evasionPath -Encoding UTF8 -Force
+                        if (-not (Test-Path $ConfigPath) -or -not (Compare-FileContent -Path $ConfigPath -Desired $desired.WsbContent)) {
+                            $backup = "$ConfigPath.bak.$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+                            if (Test-Path $ConfigPath -and (Confirm-Action 'Backup existing WSB?')) {
+                                Copy-Item $ConfigPath $backup -Force
+                                Write-Log "Existing WSB backed up to $backup." 'INFO'
+                            }
+                            $desired.WsbContent | Out-File -FilePath $ConfigPath -Encoding UTF8 -Force
+                        }
+                    }
+                    'EnsureShortcut' {
+                        if ($NoShortcut) {
+                            return
+                        }
+                        $shell = New-Object -ComObject WScript.Shell
+                        $lnk = $shell.CreateShortcut($ShortcutLnk)
+                        $lnk.TargetPath = $ConfigPath
+                        $lnk.IconLocation = "$env:SystemRoot\System32\imageres.dll,209"
+                        $lnk.Description = 'Narrative-fused Sandbox: AdminMax + Evasion Probes'
+                        $lnk.Save()
+                    }
+                }
+            } $Step
+
+            New-Item -Path $stepKey -Force | Out-Null
+            $now = Get-Date
+            Set-ItemProperty -Path $stepKey -Name 'Status' -Value 'Completed'
+            Set-ItemProperty -Path $stepKey -Name 'CompletedAt' -Value $now.ToString('yyyy-MM-dd HH:mm:ss')
+            Set-ItemProperty -Path $stepKey -Name 'Timestamp' -Value $now.ToString('o')
+            Write-Log "Step $($Step.Name) success." 'SUCCESS'
+        } catch {
+            Write-Log "Step $($Step.Name) error: $($_.Exception.Message)" 'ERROR'
+            if ($Step.Undo) {
+                Write-Log "Attempting undo for $($Step.Name)." 'WARN'
+                try {
+                    & $Step.Undo
+                    Write-Log "Undo for $($Step.Name) success." 'INFO'
+                } catch {
+                    Write-Log "Undo fail: $($_.Exception.Message). Manual remediation required." 'ERROR'
+                }
+            }
+            throw
+        }
+    } else {
+        Write-Log "Step $($Step.Name): -WhatIf skip." 'INFO'
+    }
+
+    $script:CurrentWeight += $Step.Weight / $TotalWeight * 100
+    Write-Progress -Activity 'Sandbox Setup' -Status $Step.Name -PercentComplete $script:CurrentWeight
+}
+
+function Invoke-Verification {
+    param(
+        [switch]$ReExecute
+    )
+    Write-Output 'Verification phase.'
+    $hvPresent = $false
+    try {
+        $ci = Get-ComputerInfo -Property 'HyperVisorPresent'
+        $hvPresent = [bool]$ci.HyperVisorPresent
+    } catch {
+    }
+    if (-not $hvPresent) {
+        Write-Log 'HyperVisor absent post-setup.' 'ERROR'
+        exit 2
+    }
+    $failed = @()
+    foreach ($step in $Steps) {
+        $satisfied = & $step.SystemTest
+        $stepMarkerPath = Join-Path $script:StepsKey $step.Name
+        $marker = Test-Path $stepMarkerPath -and (Get-ItemProperty $stepMarkerPath -Name 'Status' -EA SilentlyContinue).Status -eq 'Completed'
+        if (-not ($satisfied -and $marker)) {
+            $failed += $step.Name
+        }
+        Write-Verbose "Verify $($step.Name): State=$satisfied, Marker=$marker"
+    }
+    if ($failed -and $ReExecute) {
+        Write-Log "Re-executing steps: $($failed -join ', ')." 'WARN'
+        foreach ($name in $failed) {
+            $stepToInvoke = $Steps | Where-Object { $_.Name -eq $name }
+            if ($stepToInvoke) {
+                try {
+                    Invoke-Step -Step $stepToInvoke
+                } catch {
+                    Write-Log "Re-execution failed for ${name}: $($_.Exception.Message)" 'ERROR'
+                }
+            }
+        }
+        Invoke-Verification -ReExecute:$false
+        return
+    }
+    if ($failed) {
+        Write-Log "Failed: $($failed -join ', '). Remediate: Re-run or manual adjustments." 'ERROR'
+        exit 2
+    }
+
+    $evasionPath = Join-Path $ConfigDir 'evade.ps1'
+    if (Test-Path $evasionPath) {
+        $previousValue = [Environment]::GetEnvironmentVariable('SANDBOX_VALIDATE', 'Process')
+        try {
+            [Environment]::SetEnvironmentVariable('SANDBOX_VALIDATE', '1', 'Process')
+            & { . $evasionPath } -ErrorAction SilentlyContinue | Out-Null
+            Write-Verbose 'Syntax OK'
+        } catch {
+            Write-Log "evade.ps1 invalid: $($_.Exception.Message)" 'ERROR'
+            exit 2
+        } finally {
+            [Environment]::SetEnvironmentVariable('SANDBOX_VALIDATE', $previousValue, 'Process')
+        }
+    } else {
+        Write-Log "evade.ps1 missing at $evasionPath." 'WARN'
+    }
+
+    if (Test-Path $ConfigPath) {
+        try {
+            $xml = [xml](Get-Content $ConfigPath -Raw)
+            $commandText = $xml.Configuration.LogonCommand.Command
+            if ($commandText) {
+                $match = [regex]::Match($commandText, '-File\s+"(?<Path>[^"]+)"')
+                if ($match.Success) {
+                    $targetPath = $match.Groups['Path'].Value
+                    if (-not (Test-Path $targetPath)) {
+                        Write-Log "LogonCommand target missing: $targetPath" 'ERROR'
+                        exit 2
+                    }
+                }
+            }
+        } catch {
+            Write-Log "LogonCommand dry-run failure: $($_.Exception.Message)" 'ERROR'
+            exit 2
+        }
+    }
+
+    Write-Log 'Verification complete.' 'SUCCESS'
+}
+
+function Invoke-Diagnostics {
+    Write-Log 'Diagnostics start.' 'INFO'
+    foreach ($candidate in $RegistryCandidates) {
+        try {
+            $test = Join-Path $candidate 'DiagTest'
+            New-Item -Path $test -Force -ErrorAction Stop | Out-Null
+            Remove-Item -Path $test -Force -ErrorAction Stop
+            Write-Log "Registry write OK: $candidate" 'SUCCESS'
+        } catch {
+            Write-Log "Registry write FAIL: $candidate :: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    try {
+        Invoke-LogRotation
+        "Diag $(Get-Date)" | Out-File -FilePath $LogPath -Encoding UTF8 -Append -ErrorAction Stop
+        Write-Log 'Log file write OK.' 'SUCCESS'
+    } catch {
+        Write-Log "Log file write failed: $($_.Exception.Message)" 'ERROR'
+    }
+    try {
+        $state = Get-FeatureState
+        Write-Log "Feature state via diagnostics: $state" 'INFO'
+    } catch {
+        Write-Log "Feature state diagnostics failed: $($_.Exception.Message)" 'WARN'
+    }
+    Write-Log 'Diagnostics finished.' 'SUCCESS'
+}
+
+$script:RegistryBase = Resolve-RegistryBase
+$script:StepsKey = Join-Path $script:RegistryBase 'Steps'
+
+New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+Invoke-LogRotation
+Try-StartTranscript
+
+if ($Cleanup) {
+    Invoke-Cleanup
+    Stop-TranscriptSafe
+    exit 0
+}
+
+try {
+    if (-not (Test-Path $script:RegistryBase)) {
+        New-Item -Path $script:RegistryBase -Force -ErrorAction Stop | Out-Null
+    }
+    if (-not (Test-Path $script:StepsKey)) {
+        New-Item -Path $script:StepsKey -Force -ErrorAction Stop | Out-Null
+    }
+    Write-Log "Registry keys initialized at $($script:RegistryBase)." 'INFO'
+} catch {
+    Write-Log "Failed to initialize registry base $($script:RegistryBase): $($_.Exception.Message)" 'ERROR'
+    Write-Log 'Falling back to cleanup state and aborting.' 'ERROR'
+    Invoke-Cleanup
+    Stop-TranscriptSafe
+    throw 'Registry initialization failed. Exit:1'
+}
+
+if ($Diagnostics) {
+    Invoke-Diagnostics
+}
+
+function Get-StepDefinitions {
+    @(
+        @{
+            Name = 'EnableFeature'
+            Weight = 100
+            SystemTest = { Get-FeatureState -eq 'Enabled' }
+            Undo = { Disable-WindowsOptionalFeature -Online -FeatureName $FeatureName -All -ErrorAction SilentlyContinue }
+        }
+        @{
+            Name = 'EnsureWsb'
+            Weight = 100
+            SystemTest = {
+                $desired = Get-DesiredWsbContent
+                Test-Path $ConfigPath -and (Compare-FileContent -Path $ConfigPath -Desired $desired.WsbContent)
+            }
+            Undo = {
+                $resolved = Resolve-Path "$ConfigPath.bak.*" -ErrorAction SilentlyContinue
+                if ($resolved) {
+                    $latest = $resolved | Sort-Object -Property Path | Select-Object -Last 1
+                    Copy-Item $latest.Path $ConfigPath -Force
+                    Write-Log "Undo restored configuration from $($latest.Path)." 'INFO'
+                } else {
+                    Write-Log 'No backup; suggest manual restore from known good.' 'WARN'
+                }
+            }
+        }
+        @{
+            Name = 'EnsureShortcut'
+            Weight = 100
+            SystemTest = { -not $NoShortcut -and (Test-Path $ShortcutLnk) }
+            Undo = {
+                if (Test-Path $ShortcutLnk) {
+                    Remove-Item $ShortcutLnk -Force -ErrorAction SilentlyContinue
+                    Write-Log "Removed shortcut $ShortcutLnk." 'INFO'
+                } else {
+                    Write-Log 'Shortcut already absent; nothing to undo.' 'INFO'
+                }
+            }
+        }
+    )
+}
+
+$Steps = Get-StepDefinitions
+
+try {
+    Invoke-Preflight
+    Write-Progress -Activity 'Sandbox Setup' -Status 'Init' -PercentComplete 0
+    foreach ($step in $Steps) {
+        Invoke-Step -Step $step
+    }
+    Invoke-Verification -ReExecute
+    Write-Output "Narrative fusion complete: Launch via $ConfigPath or shortcut. Evasion active on boot."
+    Write-Log 'Exit:0' 'SUCCESS'
+    exit 0
+} catch {
+    Write-Log "Fatal: $($_.Exception.Message). Exit:1" 'ERROR'
+    Write-Error $_
+    exit 1
+} finally {
+    Write-Progress -Activity 'Sandbox Setup' -Completed
+    Stop-TranscriptSafe
+}
