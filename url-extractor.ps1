@@ -81,7 +81,7 @@ function Test-AndCleanUrl {
     }
 
     $uri = $null
-    if (-not [Uri]::TryCreate($cleaned, [UriKind]::Absolute, [ref]$uri)) {
+    if (-not [Uri]::TryCreate($cleaned, [UriKind]::Absolute, $uri)) {
         return $null
     }
 
@@ -103,7 +103,7 @@ function Add-UniqueUrl {
     )
 
     if ($Seen.Add($Url)) {
-        $Collector.Add($Url) | Out-Null
+        [void]$Collector.Add($Url)
     }
 }
 
@@ -161,8 +161,7 @@ function Extract-PlainUrls {
 
     $markdownRegex = '\[(?:[^\]]*)\]\((https?:\/\/[^\s)]+)\)'
     $textWithoutMarkdown = [regex]::Replace($PlainText, $markdownRegex, [string]::Empty)
-
-    $plainUrlPattern = '\bhttps?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&/=]*)'
+    $plainUrlPattern = '\bhttps?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_+.~#?&/=]*)'
     foreach ($match in [regex]::Matches($textWithoutMarkdown, $plainUrlPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
         $validated = Test-AndCleanUrl -Url $match.Value
         if ($validated) {
@@ -179,16 +178,27 @@ function Get-HtmlFragment {
         return $null
     }
 
-    $startMarker = '<!--StartFragment'
-    $endMarker = '<!--EndFragment'
+    $startOffsetMatch = [regex]::Match($RawHtml, 'StartFragment:(\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $endOffsetMatch = [regex]::Match($RawHtml, 'EndFragment:(\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+    if ($startOffsetMatch.Success -and $endOffsetMatch.Success) {
+        $startOffset = [int]$startOffsetMatch.Groups[1].Value
+        $endOffset = [int]$endOffsetMatch.Groups[1].Value
+        if ($startOffset -ge 0 -and $endOffset -gt $startOffset -and $endOffset -le $RawHtml.Length) {
+            return $RawHtml.Substring($startOffset, $endOffset - $startOffset)
+        }
+    }
+
+    $startMarker = '<!--StartFragment-->'
+    $endMarker = '<!--EndFragment-->'
     $startIndex = $RawHtml.IndexOf($startMarker)
     $endIndex = $RawHtml.IndexOf($endMarker)
 
     if ($startIndex -ge 0 -and $endIndex -gt $startIndex) {
-        $fragmentStart = $RawHtml.IndexOf('>', $startIndex)
-        $fragmentEnd = $RawHtml.IndexOf('<', $endIndex)
-        if ($fragmentStart -ge 0 -and $fragmentEnd -gt $fragmentStart) {
-            return $RawHtml.Substring($fragmentStart + 1, $fragmentEnd - $fragmentStart - 1)
+        $contentStart = $startIndex + $startMarker.Length
+        $contentEnd = $endIndex
+        if ($contentEnd -gt $contentStart) {
+            return $RawHtml.Substring($contentStart, $contentEnd - $contentStart)
         }
     }
 
@@ -224,7 +234,10 @@ function Process-TextChunk {
 
     $safeContent = Remove-ScriptContent -Content $Content
 
-    Extract-HtmlUrls -HtmlContent $safeContent -Seen $Seen -Collector $Collector
+    $looksLikeHtml = $safeContent -match '<\s*\w+[^>]*>' -or $safeContent -match '<!--'
+    if ($looksLikeHtml) {
+        Extract-HtmlUrls -HtmlContent $safeContent -Seen $Seen -Collector $Collector
+    }
     Extract-MarkdownUrls -PlainText $safeContent -Seen $Seen -Collector $Collector
     Extract-PlainUrls -PlainText $safeContent -Seen $Seen -Collector $Collector
 }
@@ -237,7 +250,7 @@ function Write-Results {
     )
 
     if (-not $Urls -or $Urls.Count -eq 0) {
-        Write-Host 'No URLs found.' -ForegroundColor Yellow
+        Write-Verbose 'No URLs found.'
         return
     }
 
@@ -289,7 +302,7 @@ end {
 
     if ($InputPath) {
         if (-not (Test-Path -LiteralPath $InputPath)) {
-            throw "Input path '$InputPath' does not exist."
+            throw [System.IO.FileNotFoundException]::new("Input path '$InputPath' does not exist.")
         }
 
         Get-Content -LiteralPath $InputPath -ReadCount 2000 | ForEach-Object {
@@ -334,5 +347,5 @@ end {
     }
 
     Write-Results -Urls $collector.ToArray() -CopyToClipboard:$CopyToClipboard -OutputPath $OutputPath
-    Write-Host ("Found {0} URL(s)." -f $collector.Count)
+    Write-Verbose ("Found {0} URL(s)." -f $collector.Count)
 }
