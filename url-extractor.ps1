@@ -255,7 +255,7 @@ function Write-Results {
 
     if ($CopyToClipboard) {
         try {
-            $ordered | Set-Clipboard -ErrorAction Stop
+            Set-Clipboard -Value ($ordered -join [Environment]::NewLine) -ErrorAction Stop
             Write-Verbose ("Copied {0} URL(s) to clipboard." -f $ordered.Count)
         }
         catch {
