@@ -35,9 +35,9 @@ back to the clipboard.
 Scans pipeline text and writes the URLs to the pipeline.
 
 .EXAMPLE
-./url-extractor.ps1 -InputPath .\input.txt -OutputPath .\urls.txt -CopyToClipboard:$false
+./url-extractor.ps1 -InputPath .\large_log.txt -OutputPath .\urls.txt
 
-Scans a file, writes URLs to urls.txt, and skips clipboard copy.
+Scans a large file in chunks (memory efficient) and writes URLs to urls.txt.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Input')]
@@ -65,7 +65,7 @@ function Remove-TrailingPunctuation {
         [string]$Url
     )
 
-    return ($Url -replace "[)\\]\\}\\.,!?;:'\"]+$", '').Trim()
+    return ($Url -replace '[)\]\}\.,!?;:''"]+$', '').Trim()
 }
 
 function Test-AndCleanUrl {
@@ -118,7 +118,7 @@ function Extract-HtmlUrls {
         return
     }
 
-    $hrefPattern = "<a\s+(?:[^>]*?\s+)?href\s*=\s*[\"'](?<url>[^\"'#\s>]+)"
+    $hrefPattern = '<a\s+(?:[^>]*?\s+)?href\s*=\s*["''](?<url>[^"''#\s>]+)'
     foreach ($match in [regex]::Matches($HtmlContent, $hrefPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
         $rawUrl = [System.Net.WebUtility]::HtmlDecode($match.Groups['url'].Value)
         $validated = Test-AndCleanUrl -Url $rawUrl
@@ -211,85 +211,22 @@ function Remove-ScriptContent {
     )
 }
 
-function Resolve-InputContent {
-    [OutputType([PSCustomObject])]
+function Process-TextChunk {
     param(
-        [string[]]$InputTextSegments,
-        [string]$InputPath,
-        [switch]$FromClipboard
+        [string]$Content,
+        [System.Collections.Generic.HashSet[string]]$Seen,
+        [System.Collections.Generic.List[string]]$Collector
     )
 
-    $plainSegments = New-Object System.Collections.Generic.List[string]
-    $htmlSegments = New-Object System.Collections.Generic.List[string]
-
-    if ($InputTextSegments) {
-        $plainSegments.AddRange($InputTextSegments)
+    if ([string]::IsNullOrWhiteSpace($Content)) {
+        return
     }
 
-    if ($InputPath) {
-        if (-not (Test-Path -LiteralPath $InputPath)) {
-            throw "Input path '$InputPath' does not exist."
-        }
+    $safeContent = Remove-ScriptContent -Content $Content
 
-        $fileContent = Get-Content -LiteralPath $InputPath -Raw -ErrorAction Stop
-        if ($fileContent) {
-            $plainSegments.Add($fileContent)
-        }
-    }
-
-    if ($FromClipboard) {
-        try {
-            $clipboardText = Get-Clipboard -Raw -ErrorAction Stop
-            if ($clipboardText) {
-                $plainSegments.Add($clipboardText)
-            }
-        }
-        catch {
-            Write-Warning 'Failed to read text from clipboard.'
-        }
-
-        try {
-            $clipboardHtml = Get-Clipboard -Format Html -ErrorAction Stop
-            if ($clipboardHtml) {
-                $htmlFragment = Get-HtmlFragment -RawHtml $clipboardHtml
-                if ($htmlFragment) {
-                    $htmlSegments.Add($htmlFragment)
-                }
-            }
-        }
-        catch {
-            Write-Verbose 'HTML clipboard format not available.'
-        }
-    }
-
-    $combinedPlain = [string]::Join([Environment]::NewLine, $plainSegments)
-    $combinedHtml = [string]::Join([Environment]::NewLine, $htmlSegments)
-
-    if ([string]::IsNullOrWhiteSpace($combinedHtml) -and ($combinedPlain -match '<html|<body|<div|<a\s+')) {
-        $combinedHtml = $combinedPlain
-    }
-
-    return [PSCustomObject]@{
-        Plain = $combinedPlain
-        Html   = Remove-ScriptContent -Content $combinedHtml
-    }
-}
-
-function Extract-Urls {
-    [OutputType([string[]])]
-    param(
-        [string]$HtmlContent,
-        [string]$PlainText
-    )
-
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $collector = New-Object 'System.Collections.Generic.List[string]'
-
-    Extract-HtmlUrls -HtmlContent $HtmlContent -Seen $seen -Collector $collector
-    Extract-MarkdownUrls -PlainText $PlainText -Seen $seen -Collector $collector
-    Extract-PlainUrls -PlainText $PlainText -Seen $seen -Collector $collector
-
-    return $collector.ToArray()
+    Extract-HtmlUrls -HtmlContent $safeContent -Seen $Seen -Collector $Collector
+    Extract-MarkdownUrls -PlainText $safeContent -Seen $Seen -Collector $Collector
+    Extract-PlainUrls -PlainText $safeContent -Seen $Seen -Collector $Collector
 }
 
 function Write-Results {
@@ -304,8 +241,7 @@ function Write-Results {
         return
     }
 
-    $ordered = $Urls | Sort-Object -Unique
-    $output = $ordered -join [Environment]::NewLine
+    $ordered = $Urls
     $ordered | ForEach-Object { Write-Output $_ }
 
     if ($OutputPath) {
@@ -314,12 +250,12 @@ function Write-Results {
             New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
         }
 
-        $output | Set-Content -LiteralPath $OutputPath -Encoding UTF8 -ErrorAction Stop
+        $ordered -join [Environment]::NewLine | Set-Content -LiteralPath $OutputPath -Encoding UTF8 -ErrorAction Stop
     }
 
     if ($CopyToClipboard) {
         try {
-            $output | Set-Clipboard -ErrorAction Stop
+            $ordered | Set-Clipboard -ErrorAction Stop
             Write-Verbose ("Copied {0} URL(s) to clipboard." -f $ordered.Count)
         }
         catch {
@@ -328,35 +264,75 @@ function Write-Results {
     }
 }
 
-begin {
-    $pipelineBuffer = New-Object System.Collections.Generic.List[string]
-}
+$seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$collector = New-Object 'System.Collections.Generic.List[string]'
+$inputSeen = $false
 
 process {
     if ($null -ne $_) {
-        $pipelineBuffer.Add([string]$_)
+        if (-not [string]::IsNullOrWhiteSpace([string]$_)) {
+            $inputSeen = $true
+            Process-TextChunk -Content ([string]$_) -Seen $seen -Collector $collector
+        }
     }
 }
 
 end {
-    $inputSegments = @()
-    if ($pipelineBuffer.Count -gt 0) {
-        $inputSegments += $pipelineBuffer
-    }
-
     if ($PSBoundParameters.ContainsKey('InputText') -and $InputText) {
-        $inputSegments += $InputText
+        foreach ($segment in $InputText) {
+            if (-not [string]::IsNullOrWhiteSpace($segment)) {
+                $inputSeen = $true
+                Process-TextChunk -Content $segment -Seen $seen -Collector $collector
+            }
+        }
     }
 
-    $resolvedContent = Resolve-InputContent -InputTextSegments $inputSegments -InputPath $InputPath -FromClipboard:$FromClipboard
+    if ($InputPath) {
+        if (-not (Test-Path -LiteralPath $InputPath)) {
+            throw "Input path '$InputPath' does not exist."
+        }
 
-    if ([string]::IsNullOrWhiteSpace($resolvedContent.Plain) -and [string]::IsNullOrWhiteSpace($resolvedContent.Html)) {
+        Get-Content -LiteralPath $InputPath -ReadCount 2000 | ForEach-Object {
+            $chunk = $_ -join [Environment]::NewLine
+            if (-not [string]::IsNullOrWhiteSpace($chunk)) {
+                $inputSeen = $true
+                Process-TextChunk -Content $chunk -Seen $seen -Collector $collector
+            }
+        }
+    }
+
+    if ($FromClipboard) {
+        try {
+            $clipboardText = Get-Clipboard -Raw -ErrorAction Stop
+            if ($clipboardText) {
+                $inputSeen = $true
+                Process-TextChunk -Content $clipboardText -Seen $seen -Collector $collector
+            }
+        }
+        catch {
+            Write-Warning 'Failed to read text from clipboard.'
+        }
+
+        try {
+            $clipboardHtml = Get-Clipboard -Format Html -ErrorAction Stop
+            if ($clipboardHtml) {
+                $htmlFragment = Get-HtmlFragment -RawHtml $clipboardHtml
+                if ($htmlFragment) {
+                    $inputSeen = $true
+                    Process-TextChunk -Content $htmlFragment -Seen $seen -Collector $collector
+                }
+            }
+        }
+        catch {
+            Write-Verbose 'HTML clipboard format not available.'
+        }
+    }
+
+    if (-not $inputSeen) {
         Write-Warning 'No input provided. Supply text, a path, pipeline input, or use -FromClipboard.'
         return
     }
 
-    $urls = Extract-Urls -HtmlContent $resolvedContent.Html -PlainText $resolvedContent.Plain
-
-    Write-Results -Urls $urls -CopyToClipboard:$CopyToClipboard -OutputPath $OutputPath
-    Write-Host ("Found {0} URL(s)." -f ($urls | Sort-Object -Unique).Count)
+    Write-Results -Urls $collector.ToArray() -CopyToClipboard:$CopyToClipboard -OutputPath $OutputPath
+    Write-Host ("Found {0} URL(s)." -f $collector.Count)
 }
