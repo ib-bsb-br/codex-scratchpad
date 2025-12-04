@@ -1,12 +1,43 @@
 <#
 .SYNOPSIS
-Extracts HTTP and HTTPS URLs from text, HTML fragments, files, or the clipboard.
+Extract HTTP/HTTPS URLs from text, HTML fragments, files, or the clipboard.
 
 .DESCRIPTION
 Parses plain text, markdown links, and HTML anchor tags to collect unique URLs,
 validates schemes, optionally writes results to a file, and can copy them back
 to the clipboard. Designed for Windows PowerShell 5.1 without requiring
 administrative privileges.
+
+.PARAMETER InputText
+Plain text content to scan. Accepts pipeline input.
+
+.PARAMETER InputPath
+Path to a file whose contents will be scanned for URLs.
+
+.PARAMETER FromClipboard
+Read HTML/text from the clipboard (CF_HTML and plain text formats).
+
+.PARAMETER CopyToClipboard
+Copy extracted URLs back to the clipboard.
+
+.PARAMETER OutputPath
+Optional file path to write extracted URLs (one per line).
+
+.EXAMPLE
+./url-extractor.ps1 -FromClipboard -CopyToClipboard
+
+Extracts URLs from clipboard HTML/text, writes them to output, and copies them
+back to the clipboard.
+
+.EXAMPLE
+"Check https://example.com and [docs](https://contoso.com/path)." | ./url-extractor.ps1
+
+Scans pipeline text and writes the URLs to the pipeline.
+
+.EXAMPLE
+./url-extractor.ps1 -InputPath .\input.txt -OutputPath .\urls.txt -CopyToClipboard:$false
+
+Scans a file, writes URLs to urls.txt, and skips clipboard copy.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Input')]
@@ -15,6 +46,7 @@ param(
     [string[]]$InputText,
 
     [Parameter(ParameterSetName = 'Input')]
+    [ValidateNotNullOrEmpty()]
     [string]$InputPath,
 
     [Parameter(ParameterSetName = 'Clipboard')]
@@ -22,6 +54,7 @@ param(
 
     [switch]$CopyToClipboard,
 
+    [ValidateNotNullOrEmpty()]
     [string]$OutputPath
 )
 
@@ -126,8 +159,11 @@ function Extract-PlainUrls {
         return
     }
 
+    $markdownRegex = '\[(?:[^\]]*)\]\((https?:\/\/[^\s)]+)\)'
+    $textWithoutMarkdown = [regex]::Replace($PlainText, $markdownRegex, [string]::Empty)
+
     $plainUrlPattern = '\bhttps?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&/=]*)'
-    foreach ($match in [regex]::Matches($PlainText, $plainUrlPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+    foreach ($match in [regex]::Matches($textWithoutMarkdown, $plainUrlPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
         $validated = Test-AndCleanUrl -Url $match.Value
         if ($validated) {
             Add-UniqueUrl -Url $validated -Seen $Seen -Collector $Collector
@@ -246,7 +282,7 @@ function Extract-Urls {
         [string]$PlainText
     )
 
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $collector = New-Object 'System.Collections.Generic.List[string]'
 
     Extract-HtmlUrls -HtmlContent $HtmlContent -Seen $seen -Collector $collector

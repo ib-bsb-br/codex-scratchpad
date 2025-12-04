@@ -27,3 +27,4 @@ Run in Windows PowerShell 5.1:
 - Extracts URLs from anchor tags in HTML (including clipboard CF_HTML fragments), markdown links, and plain text while removing inline `<script>` content.
 - Accepts input from pipeline text, parameters, files, or clipboard HTML/text without requiring administrative privileges.
 - Optionally writes URLs to a specified output path and copies results back to the clipboard when requested.
+- Deduplicates URLs case-insensitively and exposes comment-based help for Get-Help usage.
