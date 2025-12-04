@@ -161,7 +161,8 @@ function Extract-PlainUrls {
     $markdownRegex = '\[(?:[^\]]*)\]\((https?://[^\s)]+)\)'
     $textWithoutMarkdown = [regex]::Replace($PlainText, $markdownRegex, [string]::Empty)
 
-    $plainUrlPattern = '\bhttps?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&/=]*)'
+    # TLD length expanded from {1,6} to {2,63} to support longer modern domains (e.g. .technology, .international)
+    $plainUrlPattern = '\bhttps?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{2,63}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&/=]*)'
     foreach ($match in [regex]::Matches($textWithoutMarkdown, $plainUrlPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
         $validated = Test-AndCleanUrl -Url $match.Value
         if ($validated) {
