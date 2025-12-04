@@ -81,7 +81,7 @@ function Test-AndCleanUrl {
     }
 
     $uri = $null
-    if (-not [Uri]::TryCreate($cleaned, [UriKind]::Absolute, $uri)) {
+    if (-not [Uri]::TryCreate($cleaned, [UriKind]::Absolute, [ref]$uri)) {
         return $null
     }
 
