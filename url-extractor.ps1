@@ -65,7 +65,7 @@ function Remove-TrailingPunctuation {
         [string]$Url
     )
 
-    return ($Url -replace "[)\]\}\.,!?;:'\"]+$", '').Trim()
+    return ($Url -replace '[)\]\}\.,!?;:''"]+$', '').Trim()
 }
 
 function Test-AndCleanUrl {
@@ -118,7 +118,7 @@ function Extract-HtmlUrls {
         return
     }
 
-    $hrefPattern = '<a\s+(?:[^>]*?\s+)?href\s*=\s*["\'](?<url>[^"\'#\s>]+)'
+    $hrefPattern = '<a\s+(?:[^>]*?\s+)?href\s*=\s*["''](?<url>[^"''#\s>]+)'
     foreach ($match in [regex]::Matches($HtmlContent, $hrefPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
         $rawUrl = [System.Net.WebUtility]::HtmlDecode($match.Groups['url'].Value)
         $validated = Test-AndCleanUrl -Url $rawUrl
