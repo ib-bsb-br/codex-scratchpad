@@ -129,6 +129,8 @@ jobs:
 
               console.log(`✅ Repository created: ${repo.html_url}`);
               console.log(`📋 Clone URL: ${repo.clone_url}`);
+              core.setOutput('clone_url', repo.clone_url);
+              core.setOutput('html_url', repo.html_url);
               return repo.clone_url;
             } catch (error) {
               if (error.status === 422) {
@@ -143,17 +145,15 @@ jobs:
 
       - name: Initialize git and push content
         env:
-          REPO_URL: ${{ steps.create-repo.outputs.result }}
+          REPO_URL: ${{ steps.create-repo.outputs.clone_url }}
           GITHUB_TOKEN: ${{ secrets.REPO_CREATE_TOKEN }}
         run: |
           set -euo pipefail
           cd extracted_content
 
           echo "🔧 Configuring git..."
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global init.defaultBranch main
-          git config --global --add safe.directory "$(pwd)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
           if [ -d .git ]; then
             echo "🧹 Removing existing git metadata from extracted content..."
@@ -180,7 +180,6 @@ jobs:
           REPO_URL_SANITIZED=$(echo "$REPO_URL" | sed 's/^"\(.*\)"$/\1/')
           REPO_URL_WITH_TOKEN=$(echo "$REPO_URL_SANITIZED" | sed "s|https://|https://x-access-token:${GITHUB_TOKEN}@|")
           git remote add origin "$REPO_URL_WITH_TOKEN"
-          git remote -v
 
           echo "⬆️ Pushing to remote..."
           git push --verbose -u origin main
@@ -188,13 +187,14 @@ jobs:
       - name: Generate summary
         if: success()
         env:
-          REPO_URL: ${{ steps.create-repo.outputs.result }}
+          REPO_URL: ${{ steps.create-repo.outputs.html_url }}
         run: |
           echo "## ✅ Workflow Completed Successfully!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Repository Details" >> $GITHUB_STEP_SUMMARY
           echo "- **Name:** ${{ inputs.repo_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **URL:** [View Repository](${REPO_URL%.git})" >> $GITHUB_STEP_SUMMARY
+          REPO_URL_SANITIZED=$(echo "$REPO_URL" | sed 's/^"\(.*\)"$/\1/')
+          echo "- **URL:** [View Repository](${REPO_URL_SANITIZED%.git})" >> $GITHUB_STEP_SUMMARY
           echo "- **Visibility:** ${{ inputs.private_repo == 'true' && 'Private' || 'Public' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Source" >> $GITHUB_STEP_SUMMARY
