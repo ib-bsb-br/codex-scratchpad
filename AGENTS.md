@@ -282,15 +282,15 @@
   ]]></template_document>
 
   <new_raw_data><![CDATA[
-    [[new_raw_data]]
+    [[<!-- all the textual data enclosed within the USER's queries. -->]]
   ]]></new_raw_data>
 
   <attachment_files><![CDATA[
-    [[<!-- all the textual data enclosed within the files attached to this `prompt message` -->]]
+    [[<!-- all the textual data enclosed within the files located at `[[file_path]]` and fetched from `[[url]]` -->]]
   ]]></attachment_files>
-</input_data>  
+</input_data>
 
 <output_specification>
   <format>Plain text or Markdown, strictly mirroring the layout of the template.</format>
-  <language>Portuguese (Brazil)</language>
+  <language>en_US</language>
 </output_specification>
