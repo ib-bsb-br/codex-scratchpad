@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# srch flat-file collector: interactive builder + srch invocation.
+
+set -u
+set -o pipefail
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "ERROR: must run as root (sudo)." >&2
+  exit 1
+fi
+
+if ! command -v srch >/dev/null 2>&1; then
+  echo "ERROR: srch not found in PATH." >&2
+  exit 1
+fi
+
+if ! command -v fold >/dev/null 2>&1; then
+  echo "ERROR: fold not found in PATH." >&2
+  exit 1
+fi
+
+umask 000
+
+ts() { date -Is; }
+fold_line() { fold -w 1200 -s; }
+
+prompt() {
+  local label="$1" def="${2-}" ans
+  if [[ -n "$def" ]]; then
+    read -r -p "$label [$def]: " ans
+    echo "${ans:-$def}"
+  else
+    read -r -p "$label: " ans
+    echo "$ans"
+  fi
+}
+
+prompt_yesno() {
+  local q="$1" def="${2:-n}" ans
+  while :; do
+    read -r -p "$q (y/n) [$def]: " ans
+    ans="${ans:-$def}"
+    case "${ans,,}" in
+      y|yes) echo "y"; return 0 ;;
+      n|no) echo "n"; return 0 ;;
+      *) echo "Please answer y or n." >&2 ;;
+    esac
+  done
+}
+
+sanitize_folder_name() {
+  local s="$1"
+  s="${s//\//_}"
+  s="${s//\\/_}"
+  s="${s//\0/}"
+  printf '%s' "$s"
+}
+
+DEST_BASE="/home/linaro"
+DEFAULT_DEST_NAME="srch_flat_$(date +%Y%m%d_%H%M%S)"
+DEST_NAME_RAW="$(prompt "Destination folder name under ${DEST_BASE} (single level; no slashes)" "$DEFAULT_DEST_NAME")"
+DEST_NAME="$(sanitize_folder_name "$DEST_NAME_RAW")"
+
+if [[ -z "$DEST_NAME" ]]; then
+  echo "ERROR: destination folder name must not be empty." >&2
+  exit 1
+fi
+
+DESTDIR="${DEST_BASE}/${DEST_NAME}"
+LOGFILE="${DESTDIR}/operation_log.txt"
+LOCKFILE="${DESTDIR}/.rename.lock"
+LOCKDIR="${DESTDIR}/.rename.lockdir"
+HELPER="/usr/local/libexec/srch_move_one"
+
+if [[ ! -x "$HELPER" ]]; then
+  echo "ERROR: helper not found or not executable: $HELPER" >&2
+  exit 1
+fi
+
+if [[ -e "$DESTDIR" ]]; then
+  use_existing="$(prompt_yesno "Destination exists. Use it anyway?" "n")"
+  if [[ "$use_existing" != "y" ]]; then
+    echo "ERROR: destination already exists: $DESTDIR" >&2
+    exit 1
+  fi
+fi
+
+mkdir -p -- "$DESTDIR" || { echo "ERROR: cannot create destination: $DESTDIR" >&2; exit 1; }
+chmod 0777 -- "$DESTDIR" 2>/dev/null || true
+
+if [[ -e "$LOGFILE" ]]; then
+  mv -f -- "$LOGFILE" "${LOGFILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+fi
+: >"$LOGFILE" || { echo "ERROR: cannot write log: $LOGFILE" >&2; exit 1; }
+chmod 0666 -- "$LOGFILE" 2>/dev/null || true
+
+log() {
+  printf '%s %s\n' "$(ts)" "$*" | fold_line | tee -a "$LOGFILE" >&2
+}
+
+log "BEGIN collection"
+log "effective_uid=$(id -u) effective_user=$(id -un 2>/dev/null || true)"
+log "destination=$DESTDIR"
+log "logfile=$LOGFILE"
+
+SRCH_ARGS=()
+SRCH_ROOTS=()
+
+roots_raw="$(prompt "srch start directories (space-separated)" "/home/linaro /mnt /userdata /usr/share/doc")"
+# shellcheck disable=SC2206
+SRCH_ROOTS=( $roots_raw )
+
+threads="$(prompt "Threads (-t): number, or '*' for all cores, or blank for default" "")"
+[[ -n "$threads" ]] && SRCH_ARGS+=("-t" "$threads")
+
+name_mode="$(prompt "Name matching mode: none | -N (substring) | -n (regex) | -i (regex, case-insensitive)" "-n")"
+name_mode="${name_mode// /}"
+if [[ "$name_mode" != "none" && -n "$name_mode" ]]; then
+  name_neg="$(prompt_yesno "Negate the name match? (prefix '!' to the pattern)" "n")"
+  name_pat="$(prompt "Pattern for ${name_mode} (empty disables name filter)" "")"
+  if [[ -n "$name_pat" ]]; then
+    [[ "$name_neg" == "y" ]] && name_pat="!$name_pat"
+    case "$name_mode" in
+      -N|-n|-i) SRCH_ARGS+=("$name_mode" "$name_pat") ;;
+      *) log "WARN: Unrecognized name mode '$name_mode'; skipping name filter." ;;
+    esac
+  fi
+fi
+
+use_full="$(prompt_yesno "Apply pattern to full path (-a)?" "n")"
+[[ "$use_full" == "y" ]] && SRCH_ARGS+=("-a")
+
+add_e="$(prompt_yesno "Add directory exclude regex rules (-e)?" "n")"
+if [[ "$add_e" == "y" ]]; then
+  while :; do
+    ex="$(prompt "-e <dir-regex> (blank to stop)" "")"
+    [[ -z "$ex" ]] && break
+    SRCH_ARGS+=("-e" "$ex")
+  done
+fi
+
+add_E="$(prompt_yesno "Add exact directory excludes (-E)?" "n")"
+if [[ "$add_E" == "y" ]]; then
+  while :; do
+    ex2="$(prompt "-E <dir-name> (blank to stop)" "")"
+    [[ -z "$ex2" ]] && break
+    SRCH_ARGS+=("-E" "$ex2")
+  done
+fi
+
+use_Z="$(prompt_yesno "Exclude .snapshot directories (-Z)?" "y")"
+[[ "$use_Z" == "y" ]] && SRCH_ARGS+=("-Z")
+
+depth="$(prompt "Depth control (-m): e.g., '4', '2-5', '2-' (blank for unlimited)" "")"
+[[ -n "$depth" ]] && SRCH_ARGS+=("-m" "$depth")
+
+xdev="$(prompt_yesno "Stay on same filesystem for each start point (-x)?" "n")"
+[[ "$xdev" == "y" ]] && SRCH_ARGS+=("-x")
+
+ftype="$(prompt "Type filter (for completeness): f/d/l/b/c/p/k/none" "f")"
+if [[ "${ftype,,}" != "f" ]]; then
+  log "WARN: Operation moves regular files only; forcing '-f' regardless of selection ('$ftype')."
+fi
+SRCH_ARGS+=("-f")
+
+size_spec="$(prompt "Size constraint (-s): e.g., +1k, -10m, +1k:-10m (blank for none)" "")"
+[[ -n "$size_spec" ]] && SRCH_ARGS+=("-s" "$size_spec")
+
+older_days="$(prompt "Older than days (-o) (blank for none)" "")"
+[[ -n "$older_days" ]] && SRCH_ARGS+=("-o" "$older_days")
+
+older_mins="$(prompt "Older than minutes (-O) (blank for none)" "")"
+[[ -n "$older_mins" ]] && SRCH_ARGS+=("-O" "$older_mins")
+
+older_tstamp="$(prompt "Older than timestamp file (-P <file>) (blank for none)" "")"
+[[ -n "$older_tstamp" ]] && SRCH_ARGS+=("-P" "$older_tstamp")
+
+younger_days="$(prompt "Younger than days (-y) (blank for none)" "")"
+[[ -n "$younger_days" ]] && SRCH_ARGS+=("-y" "$younger_days")
+
+younger_mins="$(prompt "Younger than minutes (-Y) (blank for none)" "")"
+[[ -n "$younger_mins" ]] && SRCH_ARGS+=("-Y" "$younger_mins")
+
+younger_tstamp="$(prompt "Younger than timestamp file (-W <file>) (blank for none)" "")"
+[[ -n "$younger_tstamp" ]] && SRCH_ARGS+=("-W" "$younger_tstamp")
+
+inc_user="$(prompt "Owned by user (-u) (blank for none)" "")"
+[[ -n "$inc_user" ]] && SRCH_ARGS+=("-u" "$inc_user")
+
+exc_user="$(prompt "Not owned by user (-U) (blank for none)" "")"
+[[ -n "$exc_user" ]] && SRCH_ARGS+=("-U" "$exc_user")
+
+inc_group="$(prompt "Owned by group (-g) (blank for none)" "")"
+[[ -n "$inc_group" ]] && SRCH_ARGS+=("-g" "$inc_group")
+
+exc_group="$(prompt "Not owned by group (-G) (blank for none)" "")"
+[[ -n "$exc_group" ]] && SRCH_ARGS+=("-G" "$exc_group")
+
+inline_dirs="$(prompt "Inline subdir threshold (-I <count>) (blank for none)" "")"
+[[ -n "$inline_dirs" ]] && SRCH_ARGS+=("-I" "$inline_dirs")
+
+use_q="$(prompt_yesno "Use FIFO queue (-q)?" "n")"; [[ "$use_q" == "y" ]] && SRCH_ARGS+=("-q")
+use_Q="$(prompt_yesno "Queue sorted by inode (-Q)?" "n")"; [[ "$use_Q" == "y" ]] && SRCH_ARGS+=("-Q")
+use_X="$(prompt_yesno "Enable extremely-large-dir optimization (-X)?" "n")"; [[ "$use_X" == "y" ]] && SRCH_ARGS+=("-X")
+
+prog_v="$(prompt "Progress interval (-v <N>) (blank for none)" "")"
+[[ -n "$prog_v" ]] && SRCH_ARGS+=("-v" "$prog_v")
+
+use_S="$(prompt_yesno "Print summary stats (-S)?" "y")"; [[ "$use_S" == "y" ]] && SRCH_ARGS+=("-S")
+use_T="$(prompt_yesno "Print elapsed time (-T)?" "y")"; [[ "$use_T" == "y" ]] && SRCH_ARGS+=("-T")
+use_C="$(prompt_yesno "Suppress missing/disappearing entry errors (-C)?" "y")"; [[ "$use_C" == "y" ]] && SRCH_ARGS+=("-C")
+
+dryrun="$(prompt_yesno "Dry-run (log only; do not copy/delete)?" "y")"
+
+extra_raw="$(prompt "Additional srch arguments (space-separated; blank for none)" "")"
+if [[ -n "$extra_raw" ]]; then
+  # shellcheck disable=SC2206
+  extra_arr=( $extra_raw )
+  for a in "${extra_arr[@]}"; do SRCH_ARGS+=("$a"); done
+fi
+
+log "srch_roots=${SRCH_ROOTS[*]}"
+log "srch_args=${SRCH_ARGS[*]}"
+log "dryrun=$dryrun"
+
+confirm="$(prompt_yesno "Proceed now? (Matches will be processed by srch -r)" "n")"
+if [[ "$confirm" != "y" ]]; then
+  log "ABORTED by user"
+  exit 0
+fi
+
+export DESTDIR LOGFILE LOCKFILE LOCKDIR
+export DRYRUN="$dryrun"
+
+set +e
+srch "${SRCH_ARGS[@]}" -r "$HELPER" "${SRCH_ROOTS[@]}" 2>&1 | fold -w 1500 -s | tee -a "$LOGFILE"
+rc=${PIPESTATUS[0]}
+set -e 2>/dev/null || true
+
+log "srch_exit_code=$rc"
+
+chown -R linaro:linaro -- "$DESTDIR" 2>/dev/null || true
+chmod -R a+rwX -- "$DESTDIR" 2>/dev/null || true
+
+moved_count="$(grep -c " MOVED " "$LOGFILE" 2>/dev/null || true)"
+skip_count="$(grep -c " SKIP " "$LOGFILE" 2>/dev/null || true)"
+dry_count="$(grep -c " DRYRUN " "$LOGFILE" 2>/dev/null || true)"
+err_count="$(grep -c " ERROR " "$LOGFILE" 2>/dev/null || true)"
+
+log "SUMMARY moved=$moved_count skipped=$skip_count dryrun=$dry_count errors=$err_count"
+log "DONE destination=$DESTDIR"
+
+exit 0
