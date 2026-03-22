@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# srch per-file mover: flat destination, collision-safe renames, auditable log.
+
+set -u
+set -o pipefail
+
+DESTDIR="${DESTDIR:?}"
+LOGFILE="${LOGFILE:?}"
+LOCKFILE="${LOCKFILE:?}"
+LOCKDIR="${LOCKDIR:-}"
+DRYRUN="${DRYRUN:-n}"
+
+_ts() { date -Is; }
+_fold() { fold -w 1200 -s; }
+_log() { printf '%s %s\n' "$(_ts)" "$*" | _fold >>"$LOGFILE"; }
+
+_lock_acquire() {
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>>"$LOCKFILE"
+    flock -x 9
+    return 0
+  fi
+  if [[ -z "$LOCKDIR" ]]; then
+    LOCKDIR="${LOCKFILE}.d"
+  fi
+  while ! mkdir -- "$LOCKDIR" 2>/dev/null; do
+    sleep 0.05
+  done
+}
+
+_lock_release() {
+  if command -v flock >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ -n "$LOCKDIR" ]]; then
+    rmdir -- "$LOCKDIR" 2>/dev/null || true
+  fi
+}
+
+orig="${1-}"
+if [[ -z "$orig" ]]; then
+  _log "ERROR event=invoke_missing_path"
+  exit 0
+fi
+
+norm="$orig"
+if [[ "$norm" == ./* ]]; then
+  norm="$(pwd -P)/${norm#./}"
+elif [[ "$norm" != /* ]]; then
+  norm="$(pwd -P)/$norm"
+fi
+
+if [[ ! -f "$norm" ]]; then
+  _log "SKIP event=not_regular_file orig=\"$orig\" norm=\"$norm\""
+  exit 0
+fi
+
+base="$(basename -- "$norm")"
+
+stem="$base"
+ext=""
+if [[ "$base" == .* ]]; then
+  if [[ "$base" == .*.* ]]; then
+    ext=".${base##*.}"
+    stem="${base%$ext}"
+  fi
+else
+  if [[ "$base" == *.* ]]; then
+    ext=".${base##*.}"
+    stem="${base%$ext}"
+  fi
+fi
+
+_lock_acquire
+
+cand="$DESTDIR/$base"
+if [[ -e "$cand" ]]; then
+  i=1
+  while :; do
+    suffix="_$(printf '%03d' "$i")"
+    cand="$DESTDIR/${stem}${suffix}${ext}"
+    [[ -e "$cand" ]] || break
+    i=$((i + 1))
+  done
+fi
+
+if ! : >"$cand" 2>/dev/null; then
+  _log "ERROR event=reserve_failed orig=\"$orig\" norm=\"$norm\" dest=\"$cand\""
+  _lock_release
+  exit 0
+fi
+
+_lock_release
+
+if [[ "$DRYRUN" == "y" ]]; then
+  rm -f -- "$cand" 2>/dev/null || true
+  _log "DRYRUN event=would_move orig=\"$orig\" norm=\"$norm\" dest=\"$cand\""
+  exit 0
+fi
+
+tmp="$DESTDIR/.tmp.$(basename -- "$cand").$$.$RANDOM"
+if cp -a -- "$norm" "$tmp" 2>/dev/null; then
+  if mv -f -- "$tmp" "$cand" 2>/dev/null; then
+    if rm -f -- "$norm" 2>/dev/null; then
+      chmod 0666 -- "$cand" 2>/dev/null || true
+      chown linaro:linaro -- "$cand" 2>/dev/null || true
+      if [[ "$cand" == "$DESTDIR/$base" ]]; then
+        _log "MOVED event=direct orig=\"$orig\" norm=\"$norm\" dest=\"$cand\""
+      else
+        _log "MOVED event=collision_renamed orig=\"$orig\" norm=\"$norm\" dest=\"$cand\""
+      fi
+    else
+      _log "ERROR event=delete_failed orig=\"$orig\" norm=\"$norm\" dest=\"$cand\""
+    fi
+  else
+    rm -f -- "$tmp" 2>/dev/null || true
+    rm -f -- "$cand" 2>/dev/null || true
+    _log "ERROR event=commit_failed orig=\"$orig\" norm=\"$norm\" dest=\"$cand\""
+  fi
+else
+  rm -f -- "$tmp" 2>/dev/null || true
+  rm -f -- "$cand" 2>/dev/null || true
+  _log "ERROR event=copy_failed orig=\"$orig\" norm=\"$norm\" dest=\"$cand\""
+fi
